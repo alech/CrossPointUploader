@@ -7,7 +7,7 @@ import UniformTypeIdentifiers
 final class Uploader: ObservableObject {
     static let shared = Uploader()
 
-    @Published var epubURL: URL?
+    @Published var epubURLs: [URL] = []
     @Published var ssid: String = "CrossPoint-Reader"
     @Published var password: String = ""            // open network -> leave empty
     @Published var targetPath: String = "/"          // folder on the device's SD card
@@ -71,15 +71,16 @@ final class Uploader: ObservableObject {
 
     func start() {
         guard !busy else { return }
-        guard let url = epubURL else {
-            append("⚠️  Choose an EPUB file first.")
+        guard !epubURLs.isEmpty else {
+            append("⚠️  Choose at least one EPUB file first.")
             if autoRun { finish(false) }
             return
         }
         setBusy(true)
-        let ssid = self.ssid, pw = self.password, target = self.targetPath, reconnect = self.reconnectAfter
+        let urls = self.epubURLs, ssid = self.ssid, pw = self.password
+        let target = self.targetPath, reconnect = self.reconnectAfter
         DispatchQueue.global(qos: .userInitiated).async {
-            let ok = self.run(url: url, ssid: ssid, pw: pw, target: target, reconnect: reconnect)
+            let ok = self.run(urls: urls, ssid: ssid, pw: pw, target: target, reconnect: reconnect)
             self.setBusy(false)
             if self.autoRun { self.finish(ok) }
         }
@@ -91,7 +92,7 @@ final class Uploader: ObservableObject {
     }
 
     @discardableResult
-    private func run(url: URL, ssid: String, pw: String, target: String, reconnect: Bool) -> Bool {
+    private func run(urls: [URL], ssid: String, pw: String, target: String, reconnect: Bool) -> Bool {
         append("── Starting ──")
         guard let dev = wifiDevice() else { append("❌ Could not find a Wi-Fi interface."); return false }
         append("Wi-Fi interface: \(dev)")
@@ -121,21 +122,25 @@ final class Uploader: ObservableObject {
         }
         append("✅ Device is reachable.")
 
-        append("Uploading “\(url.lastPathComponent)” → \(target) …")
-        var ok = false
-        switch upload(fileURL: url, targetPath: target) {
-        case .success(let status, let body):
-            ok = (200..<300).contains(status)
-            append(ok ? "✅ Upload complete (HTTP \(status))."
-                      : "⚠️  Server returned HTTP \(status).")
-            if !body.isEmpty { append(body) }
-        case .failure(let err):
-            append("❌ Upload failed: \(err.localizedDescription)")
+        var allOk = true
+        for (i, url) in urls.enumerated() {
+            append("Uploading “\(url.lastPathComponent)” (\(i + 1)/\(urls.count)) → \(target) …")
+            switch upload(fileURL: url, targetPath: target) {
+            case .success(let status, let body):
+                let ok = (200..<300).contains(status)
+                append(ok ? "✅ Upload complete (HTTP \(status))."
+                          : "⚠️  Server returned HTTP \(status).")
+                if !body.isEmpty { append(body) }
+                allOk = allOk && ok
+            case .failure(let err):
+                append("❌ Upload failed: \(err.localizedDescription)")
+                allOk = false
+            }
         }
 
         maybeReconnect(reconnect, dev: dev, previous: previous)
         append("── Done ──")
-        return ok
+        return allOk
     }
 
     private func maybeReconnect(_ reconnect: Bool, dev: String, previous: String?) {
@@ -273,14 +278,14 @@ struct ContentView: View {
             Toggle("Reconnect to my usual Wi-Fi when finished", isOn: $model.reconnectAfter)
 
             HStack {
-                Button(action: choose) { Text("Choose EPUB…") }
+                Button(action: choose) { Text("Choose EPUBs…") }
                 Spacer()
                 if model.busy { ProgressView().controlSize(.small).padding(.trailing, 6) }
                 Button(action: model.start) {
                     Text(model.busy ? "Working…" : "Connect & Upload").bold()
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(model.busy || model.epubURL == nil)
+                .disabled(model.busy || model.epubURLs.isEmpty)
             }
 
             LogView(text: model.log)
@@ -297,29 +302,39 @@ struct ContentView: View {
             .background(dropTargeted ? Color.accentColor.opacity(0.08) : Color.clear)
             .frame(height: 72)
             .overlay(
-                Text(model.epubURL?.lastPathComponent ?? "Drop an .epub here or click “Choose EPUB…”")
-                    .foregroundColor(model.epubURL == nil ? .secondary : .primary)
+                Text(dropZoneLabel)
+                    .foregroundColor(model.epubURLs.isEmpty ? .secondary : .primary)
                     .padding(.horizontal, 10)
                     .lineLimit(1).truncationMode(.middle)
             )
             .onDrop(of: [UTType.fileURL], isTargeted: $dropTargeted) { providers in
-                guard let provider = providers.first else { return false }
-                _ = provider.loadObject(ofClass: NSURL.self) { obj, _ in
-                    guard let url = obj as? URL, url.pathExtension.lowercased() == "epub" else { return }
-                    DispatchQueue.main.async { model.epubURL = url }
+                guard !providers.isEmpty else { return false }
+                for provider in providers {
+                    _ = provider.loadObject(ofClass: NSURL.self) { obj, _ in
+                        guard let url = obj as? URL, url.pathExtension.lowercased() == "epub" else { return }
+                        DispatchQueue.main.async { model.epubURLs.append(url) }
+                    }
                 }
                 return true
             }
     }
 
+    private var dropZoneLabel: String {
+        switch model.epubURLs.count {
+        case 0: return "Drop .epub files here or click “Choose EPUBs…”"
+        case 1: return model.epubURLs[0].lastPathComponent
+        default: return model.epubURLs.map(\.lastPathComponent).joined(separator: ", ")
+        }
+    }
+
     private func choose() {
         let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = false
+        panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         if let epub = UTType(filenameExtension: "epub") {
             panel.allowedContentTypes = [epub]
         }
-        if panel.runModal() == .OK { model.epubURL = panel.url }
+        if panel.runModal() == .OK { model.epubURLs = panel.urls }
     }
 }
 
@@ -351,21 +366,21 @@ struct LogView: NSViewRepresentable {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // An .epub given on the command line triggers headless auto mode:
-        //   ./CrossPointUploader.app/Contents/MacOS/CrossPointUploader book.epub
-        //   open CrossPointUploader.app --args /path/book.epub
-        let epubArg = CommandLine.arguments.dropFirst()
+        // One or more .epub paths given on the command line trigger headless auto mode:
+        //   ./CrossPointUploader.app/Contents/MacOS/CrossPointUploader book1.epub book2.epub
+        //   open CrossPointUploader.app --args /path/book1.epub /path/book2.epub
+        let epubArgs = CommandLine.arguments.dropFirst()
             .map { URL(fileURLWithPath: $0) }
-            .first {
+            .filter {
                 $0.pathExtension.lowercased() == "epub"
                     && FileManager.default.fileExists(atPath: $0.path)
             }
 
-        if let url = epubArg {
+        if !epubArgs.isEmpty {
             // Headless: no window focus-stealing, run everything, then exit.
             NSApp.setActivationPolicy(.accessory)
             let m = Uploader.shared
-            m.epubURL = url
+            m.epubURLs = epubArgs
             m.mirrorToStdout = true
             m.autoRun = true
             m.start()
@@ -376,11 +391,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // Finder double-click, or: open -a CrossPointUploader.app book.epub
+    // Finder multi-select double-click, or: open -a CrossPointUploader.app book1.epub book2.epub
     func application(_ application: NSApplication, open urls: [URL]) {
-        if let epub = urls.first(where: { $0.pathExtension.lowercased() == "epub" }) {
-            Uploader.shared.epubURL = epub
-        }
+        let epubs = urls.filter { $0.pathExtension.lowercased() == "epub" }
+        if !epubs.isEmpty { Uploader.shared.epubURLs = epubs }
         NSApp.activate(ignoringOtherApps: true)
     }
 

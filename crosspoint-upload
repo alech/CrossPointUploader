@@ -1,8 +1,9 @@
 #!/bin/bash
-# Headless upload: joins CrossPoint-Reader Wi-Fi, uploads the given .epub,
+# Headless upload: joins CrossPoint-Reader Wi-Fi, uploads the given .epub(s),
 # reconnects to your previous network, and exits (0 = success, 1 = failure).
 #
 #   ./crosspoint-upload /path/to/book.epub
+#   ./crosspoint-upload /path/to/book1.epub /path/to/book2.epub …
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 exec "$DIR/CrossPointUploader.app/Contents/MacOS/CrossPointUploader" "$@"
