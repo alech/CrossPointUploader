@@ -27,6 +27,14 @@ mirroring progress to the terminal and exiting `0` on success, `1` on failure:
 ./CrossPointUploader.app/Contents/MacOS/CrossPointUploader /path/to/book.epub
 ```
 
+Upload into a specific folder on the device with `-d` / `--dir` / `--path`
+(defaults to `/`, the SD-card root). The folder — and any missing parent
+folders — is created on the device if it doesn't exist yet:
+
+```bash
+./crosspoint-upload --dir /Books/SciFi /path/to/book1.epub /path/to/book2.epub
+```
+
 Use `crosspoint-upload`, not `open --args`: `open` re-activates an *already
 running* copy without passing the new file (that's why the earlier arg was
 ignored). The launcher starts a fresh process every time.
@@ -39,7 +47,8 @@ Running with no argument (or double-clicking the app) opens the normal window.
 2. Launch `CrossPointUploader.app`.
 3. Drop an `.epub` onto the window (or click **Choose EPUB…**).
 4. Leave **Wi-Fi SSID** as `CrossPoint-Reader` (open network, no password).
-   Set **Device folder** to where you want the file (defaults to `/`, the SD-card root).
+   Set **Device folder** to where you want the file (defaults to `/`, the SD-card
+   root); it's created on the device if it doesn't exist yet.
 5. Click **Connect & Upload**.
 
 The first run pops the macOS **Local Network** permission prompt — allow it.
@@ -52,14 +61,20 @@ rejoin doesn't take). Uncheck *Reconnect…* to stay on the reader's hotspot.
 Discovered from the CrossPoint firmware docs (`docs/webserver-endpoints.md`):
 
 ```
-POST http://crosspoint.local/upload?path=/          # multipart/form-data, field name "file"
+POST http://crosspoint.local/mkdir                   # form fields: name, path (parent)
+POST http://crosspoint.local/upload?path=/           # multipart/form-data, field name "file"
 ```
 
 Equivalent to:
 
 ```bash
-curl -X POST -F "file=@book.epub" "http://crosspoint.local/upload?path=/"
+curl -X POST -d "name=SciFi&path=/Books" http://crosspoint.local/mkdir
+curl -X POST -F "file=@book.epub" "http://crosspoint.local/upload?path=/Books/SciFi"
 ```
+
+`/mkdir` only makes one level at a time and returns `400 Folder already exists`
+for a folder that's already there, so the app walks the target path and creates
+each missing component, treating "already exists" as success.
 
 Wi-Fi switching uses `/usr/sbin/networksetup`; no admin password is needed to
 join an open network.

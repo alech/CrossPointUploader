@@ -92,7 +92,8 @@ final class Uploader: ObservableObject {
     }
 
     @discardableResult
-    private func run(urls: [URL], ssid: String, pw: String, target: String, reconnect: Bool) -> Bool {
+    private func run(urls: [URL], ssid: String, pw: String, target rawTarget: String, reconnect: Bool) -> Bool {
+        let target = normalizeTarget(rawTarget)
         append("── Starting ──")
         guard let dev = wifiDevice() else { append("❌ Could not find a Wi-Fi interface."); return false }
         append("Wi-Fi interface: \(dev)")
@@ -121,6 +122,16 @@ final class Uploader: ObservableObject {
             return false
         }
         append("✅ Device is reachable.")
+
+        // Make sure the destination folder exists before we start uploading;
+        // /upload won't create missing directories on its own.
+        if target != "/" {
+            append("Ensuring folder \(target) exists …")
+            if !ensureDirectory(target) {
+                maybeReconnect(reconnect, dev: dev, previous: previous)
+                return false
+            }
+        }
 
         var allOk = true
         for (i, url) in urls.enumerated() {
@@ -244,6 +255,80 @@ final class Uploader: ObservableObject {
     private func err(_ msg: String) -> Error {
         NSError(domain: "CrossPoint", code: 1, userInfo: [NSLocalizedDescriptionKey: msg])
     }
+
+    // MARK: Directories
+
+    /// Canonicalise a user-supplied folder path: ensure a single leading slash,
+    /// drop any trailing slash (except for the root itself).
+    private func normalizeTarget(_ path: String) -> String {
+        var p = path.trimmingCharacters(in: .whitespaces)
+        if p.isEmpty { return "/" }
+        if !p.hasPrefix("/") { p = "/" + p }
+        while p.count > 1 && p.hasSuffix("/") { p.removeLast() }
+        return p
+    }
+
+    /// Create every missing component of `path` on the device. The firmware's
+    /// /mkdir only makes one level at a time, so we walk the path and create
+    /// each segment, treating "already exists" as success.
+    private func ensureDirectory(_ path: String) -> Bool {
+        let components = path.split(separator: "/").map(String.init)
+        var parent = "/"
+        for comp in components {
+            switch mkdir(name: comp, parent: parent) {
+            case .ok:
+                append("📁 Created \(parent == "/" ? "" : parent)/\(comp)")
+            case .exists:
+                break
+            case .failed(let msg):
+                append("❌ Could not create folder “\(comp)” in \(parent): \(msg)")
+                return false
+            }
+            parent = parent == "/" ? "/\(comp)" : "\(parent)/\(comp)"
+        }
+        return true
+    }
+
+    private enum MkdirResult { case ok, exists, failed(String) }
+
+    /// POST /mkdir with form-encoded `name` and parent `path`.
+    private func mkdir(name: String, parent: String) -> MkdirResult {
+        guard let url = URL(string: "http://\(host)/mkdir") else { return .failed("bad URL") }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 15
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        req.httpBody = Data("name=\(formEncode(name))&path=\(formEncode(parent))".utf8)
+
+        let sem = DispatchSemaphore(value: 0)
+        var result: MkdirResult = .failed("no response from device")
+        let task = URLSession.shared.dataTask(with: req) { data, resp, error in
+            defer { sem.signal() }
+            if let error = error { result = .failed(error.localizedDescription); return }
+            let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            let text = (data.flatMap { String(data: $0, encoding: .utf8) } ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            switch status {
+            case 200:
+                result = .ok
+            case 400 where text.range(of: "exists", options: .caseInsensitive) != nil:
+                result = .exists
+            default:
+                result = .failed("HTTP \(status)\(text.isEmpty ? "" : ": \(text)")")
+            }
+        }
+        task.resume()
+        _ = sem.wait(timeout: .now() + 20)
+        return result
+    }
+
+    /// Percent-encode a form field value, keeping "/" literal so parent paths
+    /// stay readable on the wire.
+    private func formEncode(_ s: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~/")
+        return s.addingPercentEncoding(withAllowedCharacters: allowed) ?? s
+    }
 }
 
 // MARK: - View
@@ -365,11 +450,34 @@ struct LogView: NSViewRepresentable {
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Split raw CLI args into an optional destination folder and the remaining
+    /// (file) arguments. Accepts `-d DIR`, `--dir DIR`, `--path DIR`, and the
+    /// `--dir=DIR` / `--path=DIR` forms.
+    static func parseArgs(_ args: [String]) -> (dir: String?, files: [String]) {
+        var dir: String?
+        var files: [String] = []
+        var i = 0
+        while i < args.count {
+            let a = args[i]
+            if a == "-d" || a == "--dir" || a == "--path" {
+                if i + 1 < args.count { dir = args[i + 1]; i += 2; continue }
+            } else if let eq = ["--dir=", "--path="].first(where: { a.hasPrefix($0) }) {
+                dir = String(a.dropFirst(eq.count))
+            } else {
+                files.append(a)
+            }
+            i += 1
+        }
+        return (dir, files)
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // One or more .epub paths given on the command line trigger headless auto mode:
-        //   ./CrossPointUploader.app/Contents/MacOS/CrossPointUploader book1.epub book2.epub
-        //   open CrossPointUploader.app --args /path/book1.epub /path/book2.epub
-        let epubArgs = CommandLine.arguments.dropFirst()
+        // One or more .epub paths given on the command line trigger headless auto mode.
+        // An optional destination folder is set with -d/--dir/--path (created if missing):
+        //   ./CrossPointUploader.app/Contents/MacOS/CrossPointUploader -d /Books book1.epub …
+        //   open CrossPointUploader.app --args --dir /Books /path/book1.epub /path/book2.epub
+        let (targetDir, fileArgs) = Self.parseArgs(Array(CommandLine.arguments.dropFirst()))
+        let epubArgs = fileArgs
             .map { URL(fileURLWithPath: $0) }
             .filter {
                 $0.pathExtension.lowercased() == "epub"
@@ -381,6 +489,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.setActivationPolicy(.accessory)
             let m = Uploader.shared
             m.epubURLs = epubArgs
+            if let targetDir, !targetDir.isEmpty { m.targetPath = targetDir }
             m.mirrorToStdout = true
             m.autoRun = true
             m.start()
