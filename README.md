@@ -4,7 +4,7 @@ A tiny macOS app that joins the **CrossPoint-Reader** Wi-Fi and uploads an `.epu
 to the device's web server at `http://crosspoint.local/upload`. It then disconnects
 from the CrossPoint wifi.
 
-This is vibe-cauded using Claude Opus 4.8 but works for me. YMMV.
+This is vibe-coded using Claude Opus 4.8 but works for me. YMMV.
 
 ## Build
 
